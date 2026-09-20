@@ -1,0 +1,4 @@
+requests==2.34.2
+arelle-release==2.45.1
+aniso8601==9.0.1
+z3-solver==5.1.0.0
