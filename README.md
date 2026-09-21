@@ -182,17 +182,76 @@ list. Prints a readable summary and writes the full report as JSON.
 Filings are always reported individually, never averaged together.
 
 ### `solver.py` — can every constraint hold at once? (Z3)
-**Status: A1–A2 done (satisfiability gate); fault injection not started.**
+**Status: done (satisfiability gate; used by `inject.py`).**
 `check.py` tests constraints one by one; `solver.py` asks Z3 whether they
 can all hold together given the values the filing reports. Every unique
 numeric fact becomes a Z3 variable pinned to its reported value, and every
-complete filer-calc constraint becomes a rounding-band inequality. **SAT**
+complete filer-calc or ratio-identity constraint becomes a rounding-band inequality. **SAT**
 means the filing is internally consistent and safe to use as a "clean"
 document; **UNSAT** returns the unsat core (the constraints that can't all
 hold). Partial constraints are left out (they can be context-matching
 artifacts) and DQC findings add no equations. `python solver.py [url]`
 also runs a smoke test: shift one total outside its band and confirm Z3
 flips to UNSAT and names the broken constraint.
+
+### `ratios.py` — ratio library from the reference PDFs (Workstream B)
+**Status: done.** `python ratios.py AAPL` prints every ratio for the latest
+10-K. Two separate jobs:
+
+1. **Ratios (52).** Formulas from the CFA Level II list and the Duke FSA
+   note (read as text), cited also by page in the CFI and Gillingham books
+   (their formulas are images, so only "which page discusses it" is recorded).
+   A ratio is **never** treated as an error, since a current ratio of 0.9
+   or 5 can both be normal. Per filing each ratio is `computed` or
+   `not_usable` with a reason: `missing_terms` (the filing has no matching
+   tag), `needs_prior_period` (average-balance ratios need last year's
+   balance), `no_standard_xbrl_concept` (e.g. daily cash expenditures) or
+   `not_in_filing` (stock price for P/E). Every result lists the exact
+   facts (concept, fact id, value) used and the PDF(s) that define it.
+   Rule-of-thumb ranges (Duke) are flagged as **advisory only**. Basic EPS
+   computed from net income and weighted shares is also compared with the
+   EPS the filing reports (within rounding): a real cross-check.
+2. **Identities (5 rules, ~13 instances per filing).** Equalities the
+   ratio definitions rely on: gross profit = revenue - cost of revenue,
+   operating income = gross profit - operating expenses, net income =
+   pretax income - tax, total assets = liabilities and equity, and
+   liabilities and equity = liabilities + equity (including non-controlling
+   and redeemable interests when reported; the most specific variant whose
+   lines are all reported is used). These are emitted as constraints with
+   `rule_source: "ratio-identity"`, so `check.py`, `solver.py` (Z3),
+   `orphans.py`, `inject.py` and `verify.py` treat them like filer-calc
+   rules; `report.py` lists them separately from the filer-calc headline.
+
+The term-to-concept mapping (`TERMS` in the file, e.g. "cash" -> first of
+`CashAndCashEquivalentsAtCarryingValue`, `Cash`) is ours, not from any PDF.
+Approximations to know about: EBIT is taken as operating income; total debt
+is commercial paper + current debt + non-current debt; interest expense is
+used where the CFA list says interest payments.
+
+### `inject.py` — make provably-bad copies of a provably-clean filing
+**Status: done for filer-calc and ratio-identity constraints (fixed offset just past the rounding band).**
+`python inject.py AAPL --count 5` (a ticker or a filing URL; `--count N` =
+how many different errors, default 1). Requires the clean filing to be SAT.
+For each case it picks a different fact used by ≥2 complete constraints
+(and a different broken rule), raises its magnitude just past the tightest
+rounding band, and has Z3 predict UNSAT plus the unsat core. It copies the
+original `.htm` and changes only the text inside that fact's `ix:nonFraction`
+tag(s), in every place the fact is printed. Each case is then re-parsed with
+Arelle and Z3 and must be UNSAT with the predicted core; the clean file must
+be SAT. Only `ixt:num-dot-decimal` numbers are editable.
+
+Output, `datasets/<TICKER>/<accession>/`:
+- `good.htm` — clean original (SAT)
+- `for_llm/case_NN.htm` — corrupted files to feed the model under test
+- `answers/case_NN.txt` / `.json` — answer keys (keep away from the model)
+- `summary.json` — one row per case, with verification status
+- `_support/` — schema + linkbase files Arelle needs for local copies
+
+### `verify.py` — manual full check of one local file
+`python verify.py datasets/AAPL/<accession>/for_llm/case_01.htm [--dqc]`.
+Runs extract → constraints → exact and rounding-band math → Z3, and prints
+`CLEAN (SAT)` or `ERROR FOUND (UNSAT)` (exit code 0/1). `--dqc` adds the slow
+DQC pass.
 
 ## Supporting files
 
@@ -226,7 +285,10 @@ Apple's real FY2025 10-K and produced a complete report:
 | Check consistency | `check.py` | ✅ done, tested — 168/168 filer-calc pass exactly |
 | Detect orphans | `orphans.py` | ✅ done, tested — 341/880 facts orphaned |
 | Generate report | `report.py` | ✅ done, tested — full JSON + readable summary |
-| Orchestrate everything | `run.py` | ✅ done — ticker in, `report_<TICKER>_<accession>.json` out |
+| Orchestrate everything | `run.py` | ✅ done — ticker in, `report_<TICKER>_<accession>.json` (+ constraints and ratios CSVs) out |
+| Z3 gate | `solver.py` | ✅ done — SAT on clean Apple and Tesla |
+| Ratio library | `ratios.py` | ✅ done — 52 ratios, 5 identity rules, EPS cross-check |
+| Bug injection dataset | `inject.py`, `verify.py` | ✅ done — N verified cases per filing, answer keys |
 
 **Known gaps / not yet handled:**
 - Filer-calc constraints where some declared children aren't reported at

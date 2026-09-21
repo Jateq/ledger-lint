@@ -15,6 +15,7 @@ Model:
         sum(weight_i * child_i) - total  <=  band
         sum(weight_i * child_i) - total  >= -band
     where band is the propagated rounding band from check.py
+Ratio-library identities (ratios.py, rule_source "ratio-identity") are encoded exactly like filer-calc rules.
 Partial constraints (some declared children unreported) are left out: they
 can be artifacts of context matching and would make a clean filing look
 UNSAT. DQC findings are tagging checks with no arithmetic, so they add no
@@ -24,6 +25,8 @@ equations here.
 from decimal import Decimal
 
 import z3
+
+ENCODED_SOURCES = ("filer-calc", "ratio-identity")
 
 
 def to_real(value: Decimal):
@@ -49,7 +52,7 @@ def build_solver(unique_numeric_facts: list, checked_constraints: list):
 
     tracked = {}
     for c in checked_constraints:
-        if c["rule_source"] != "filer-calc" or c.get("partial"):
+        if c["rule_source"] not in ENCODED_SOURCES or c.get("partial"):
             continue
 
         total = variables[c["total_fact_id"]]

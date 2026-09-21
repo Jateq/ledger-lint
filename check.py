@@ -19,6 +19,9 @@ how fragile each check actually is.
 from decimal import Decimal
 
 
+SUM_SOURCES = ("filer-calc", "ratio-identity")
+
+
 def fact_tolerance(decimals) -> Decimal:
     """
     Half of the smallest increment a fact's `decimals` attribute could
@@ -83,7 +86,7 @@ def check_constraints(constraints: list, unique_numeric_facts: list) -> list:
 
     checked = []
     for constraint in constraints:
-        if constraint["rule_source"] == "filer-calc":
+        if constraint["rule_source"] in SUM_SOURCES:
             checked.append(check_filer_calc_constraint(constraint, fact_by_id))
         else:
             checked.append(constraint)

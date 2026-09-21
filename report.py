@@ -13,8 +13,44 @@ from decimal import Decimal
 from pathlib import Path
 
 
+def _ratio_sections(ratio_out, checked_constraints):
+    """Ratio-library usage + identity results (kept out of the filer-calc headline)."""
+    if ratio_out is None:
+        return None
+    ident = [c for c in checked_constraints if c["rule_source"] == "ratio-identity"]
+    complete = [c for c in ident if not c.get("partial")]
+    by_rule = {}
+    for c in complete:
+        row = by_rule.setdefault(c["ratio_rule_id"], {"checked": 0, "failed": 0})
+        row["checked"] += 1
+        row["failed"] += 0 if c["pass_rounding_tolerance"] else 1
+    return {
+        "fiscal_period": ratio_out["fiscal_period"],
+        "usage": ratio_out["summary"],
+        "ratios": [
+            {"id": r["id"], "name": r["name"], "category": r["category"], "status": r["status"],
+             "reason": r["reason"], "detail": r["detail"], "value": r["value"],
+             "sources": r["sources"],
+             "inputs": [{"term": i["term"], "at": i["at"], "concept": i.get("concept"),
+                         "fact_id": i.get("fact_id"), "assumed_zero": i.get("assumed_zero", False)}
+                        for i in r["inputs"]],
+             "advisory": r["advisory"], "crosscheck": r.get("crosscheck")}
+            for r in ratio_out["results"]
+        ],
+        "identities": {
+            "checked": len(complete),
+            "failed_band": sum(1 for c in complete if not c["pass_rounding_tolerance"]),
+            "by_rule": by_rule,
+            "note": "identities like assets = liabilities + equity are rules a clean filing must satisfy; "
+                    "ratios themselves are never treated as errors.",
+        },
+    }
+
+
 def build_report(url: str, extraction_counts: dict, checked_constraints: list,
-                  failures: list, marked_facts: list, orphan_stats: dict) -> dict:
+                  failures: list, marked_facts: list, orphan_stats: dict,
+                  ratio_out: dict | None = None, z3: dict | None = None,
+                  injection_dataset: dict | None = None) -> dict:
     calc_all = [c for c in checked_constraints if c["rule_source"] == "filer-calc"]
     dqc = [c for c in checked_constraints if c["rule_source"] == "DQC"]
 
@@ -57,6 +93,7 @@ def build_report(url: str, extraction_counts: dict, checked_constraints: list,
             "by_rule_source": {
                 "filer-calc": len(calc_all),
                 "DQC": len(dqc),
+                "ratio-identity": sum(1 for c in checked_constraints if c["rule_source"] == "ratio-identity"),
             },
             "spans_sections_count": spans_count,
             "spans_sections_pct": (
@@ -82,6 +119,9 @@ def build_report(url: str, extraction_counts: dict, checked_constraints: list,
             },
         },
         "failures": failures,
+        "ratio_library": _ratio_sections(ratio_out, checked_constraints),
+        "z3": z3,
+        "injection_dataset": injection_dataset,
     }
 
 
@@ -127,6 +167,12 @@ def summary_row(report: dict) -> dict:
         "calc_partial_failed": cal["partial_failed"],
         "dqc_violations": report["consistency"]["dqc"]["violations_found"],
         "failures": len(report["failures"]),
+        "constraints_ratio_identity": con["by_rule_source"].get("ratio-identity", 0),
+        "ratios_computed": (report.get("ratio_library") or {}).get("usage", {}).get("computed", ""),
+        "ratios_not_usable": (report.get("ratio_library") or {}).get("usage", {}).get("not_usable", ""),
+        "ratio_identities_checked": (report.get("ratio_library") or {}).get("identities", {}).get("checked", ""),
+        "ratio_identities_failed": (report.get("ratio_library") or {}).get("identities", {}).get("failed_band", ""),
+        "z3_status": (report.get("z3") or {}).get("status", ""),
     }
 
 
@@ -141,12 +187,27 @@ def across_filings(reports: list) -> dict:
         r for r in checked
         if r["consistency"]["filer_calc"]["fail_even_with_rounding_band"] == 0
     ]
+    usage = {}
+    with_ratios = [r for r in reports if r.get("ratio_library")]
+    for r in with_ratios:
+        for x in r["ratio_library"]["ratios"]:
+            row = usage.setdefault(x["id"], {"computed": 0, "not_usable": 0})
+            row["computed" if x["status"] == "computed" else "not_usable"] += 1
     return {
         "filings_tested": len(reports),
         "filings_with_filer_calc_checks": len(checked),
         "filings_fully_consistent": len(consistent),
         "fraction_consistent": (len(consistent) / len(checked)) if checked else None,
+        "ratio_usage_across_filings": usage,
     }
+
+
+def write_ratios_csv(ratio_rows: list, path) -> None:
+    """One row per ratio for one filing: value or why it was not usable, with sources and inputs."""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(ratio_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(ratio_rows)
 
 
 def write_summary_csv(reports: list, path) -> None:
@@ -162,7 +223,7 @@ CONSTRAINT_CSV_FIELDS = [
     "constraint_id", "rule_source", "kind", "rule_code", "spans_sections", "result",
     "total_value", "sum_of_components", "residual", "band",
     "pass_zero_tolerance", "pass_rounding_tolerance", "headroom",
-    "min_injectable_delta", "involved_fact_ids", "message",
+    "min_injectable_delta", "involved_fact_ids", "message", "ratio_rule_id",
 ]
 
 
@@ -197,7 +258,8 @@ def print_report(report: dict) -> None:
 
     con = report["constraints"]
     print("\nConstraints:")
-    print(f"  total: {con['total']}  (filer-calc: {con['by_rule_source']['filer-calc']}, DQC: {con['by_rule_source']['DQC']})")
+    print(f"  total: {con['total']}  (filer-calc: {con['by_rule_source']['filer-calc']}, DQC: {con['by_rule_source']['DQC']}, "
+          f"ratio-identity: {con['by_rule_source'].get('ratio-identity', 0)})")
     print(f"  spanning sections: {con['spans_sections_count']} ({con['spans_sections_pct']}%)")
 
     cal = report["consistency"]["filer_calc"]
@@ -212,6 +274,29 @@ def print_report(report: dict) -> None:
 
     dqc = report["consistency"]["dqc"]
     print(f"\nDQC violations found: {dqc['violations_found']}")
+
+    rl = report.get("ratio_library")
+    if rl:
+        u = rl["usage"]
+        print(f"\nRatio library ({rl['fiscal_period']['start'][:10]} .. {rl['fiscal_period']['end'][:10]}):")
+        print(f"  ratios in library: {u['ratios_in_library']}   computed: {u['computed']}   not usable: {u['not_usable']}")
+        print(f"  not usable by reason: {u['not_usable_by_reason']}")
+        print(f"  computed ratios by source PDF: {u['computed_by_source_pdf']}")
+        print(f"  outside a textbook rule of thumb (advisory only): {u['outside_rule_of_thumb_advisory']}")
+        print(f"  EPS cross-check (computed vs reported): {u['eps_crosscheck']}")
+        idn = rl["identities"]
+        print(f"  ratio identities: {idn['checked']} checked, {idn['failed_band']} fail the rounding band")
+
+    z3 = report.get("z3")
+    if z3:
+        print(f"\nZ3 satisfiability: {z3['status'].upper()} ({z3['constraints_encoded']} constraints, {z3['variables']} variables)")
+        if z3["unsat_core"]:
+            print("  broken:", z3["unsat_core"][:5])
+
+    inj = report.get("injection_dataset")
+    if inj:
+        print(f"\nInjection dataset on disk: {inj['produced']} case(s), "
+              f"{sum(1 for c in inj['cases'] if c['verified'])} verified")
 
     fails = report["failures"]
     print(f"\nExtraction/rule-execution failures: {len(fails)}")

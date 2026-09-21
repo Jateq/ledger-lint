@@ -14,6 +14,7 @@ Each filing gets its own report under reports/ (report_<TICKER>_<accession>.json
 companies/years is expected and meaningful.
 """
 
+import json
 from pathlib import Path
 
 import fetch
@@ -21,7 +22,9 @@ import extract
 import constraints as constraints_mod
 import check
 import orphans
+import ratios
 import report as report_mod
+import solver
 
 
 def get_filing_urls(ticker: str, limit: int = 1) -> list:
@@ -34,10 +37,11 @@ def get_filing_urls(ticker: str, limit: int = 1) -> list:
     ]
 
 
-def run_one_filing(url: str) -> dict:
+def run_one_filing(url: str, ticker: str = "") -> tuple:
     """
-    Run the full pipeline for one filing: extract -> build constraints ->
-    check -> find orphans -> build report. Returns the report dict.
+    Run the full pipeline for one filing: extract -> build constraints (filer-calc,
+    DQC, ratio identities) -> check -> Z3 -> ratio library -> orphans -> report.
+    Returns (report, checked_constraints, ratio_rows).
     """
     print(f"Loading {url} ...")
     model = extract.load_filing(url)
@@ -48,17 +52,28 @@ def run_one_filing(url: str) -> dict:
     print("  building constraints (filer-calc + DQC — DQC takes a few minutes) ...")
     build_result = constraints_mod.build_constraints(model, url, records, unique_numeric)
 
+    print("  ratio library (formulas from the reference PDFs) ...")
+    ratio_analysis = ratios.analyze(unique_numeric)
+
     print("  checking constraints ...")
-    checked = check.check_constraints(build_result["constraints"], unique_numeric)
+    checked = check.check_constraints(build_result["constraints"], unique_numeric) + ratio_analysis["identities"]
+
+    print("  Z3 satisfiability (filer-calc + ratio identities) ...")
+    z3_result = solver.check_satisfiability(unique_numeric, checked)
 
     print("  marking orphans ...")
     marked = orphans.mark_orphans(unique_numeric, checked)
     orphan_stats = orphans.orphan_summary(marked, checked)
 
+    accession = url.rstrip("/").split("/")[-2]
+    summary_path = Path("datasets") / ticker / accession / "summary.json"
+    injection = json.loads(summary_path.read_text()) if ticker and summary_path.exists() else None
+
     report = report_mod.build_report(
-        url, extraction_counts, checked, build_result["failures"], marked, orphan_stats
+        url, extraction_counts, checked, build_result["failures"], marked, orphan_stats,
+        ratio_out=ratio_analysis["ratios"], z3=z3_result, injection_dataset=injection,
     )
-    return report, checked
+    return report, checked, ratios.ratio_rows(ratio_analysis["ratios"])
 
 
 if __name__ == "__main__":
@@ -81,7 +96,7 @@ if __name__ == "__main__":
     all_reports = []
     for url in urls:
         print()
-        report, checked = run_one_filing(url)
+        report, checked, ratio_rows = run_one_filing(url, ticker.upper())
         all_reports.append(report)
 
         print("\n" + "=" * 60)
@@ -92,7 +107,8 @@ if __name__ == "__main__":
         with open(f"{base}.json", "w") as f:
             f.write(report_mod.report_to_json(report))
         report_mod.write_constraints_csv(checked, f"{base}_constraints.csv")
-        print(f"\nWritten: {base}.json and {base}_constraints.csv")
+        report_mod.write_ratios_csv(ratio_rows, f"{base}_ratios.csv")
+        print(f"\nWritten: {base}.json, {base}_constraints.csv and {base}_ratios.csv")
 
     summary_path = reports_dir / f"summary_{ticker}.csv"
     report_mod.write_summary_csv(all_reports, summary_path)
@@ -103,3 +119,10 @@ if __name__ == "__main__":
         f"Across tested filings: {tally['filings_fully_consistent']} of "
         f"{tally['filings_with_filer_calc_checks']} had every checked filer-calc constraint pass"
     )
+    usage = tally["ratio_usage_across_filings"]
+    if usage:
+        n = len(all_reports)
+        always = sum(1 for u in usage.values() if u["computed"] == n)
+        never = sum(1 for u in usage.values() if u["computed"] == 0)
+        print(f"Ratio usage across {n} filing(s): {len(usage)} ratios in library, "
+              f"{always} computable in every filing, {never} in none")
