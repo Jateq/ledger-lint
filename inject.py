@@ -237,6 +237,14 @@ def _json_default(o):
     return float(o) if isinstance(o, Decimal) else str(o)
 
 
+def _period_label(period: dict) -> str:
+    if period["type"] == "instant":
+        return f"as of {period['instant'][:10]}"
+    if period["type"] == "duration":
+        return f"fiscal year {period['start'][:10]} to {period['end'][:10]}"
+    return "period: forever"
+
+
 def inject(filing_url: str, count: int = 1, rank: int = 0, label: str = "filing") -> dict:
     """
     Make `count` corrupted copies of one clean filing, each with ONE different
@@ -328,6 +336,7 @@ def inject(filing_url: str, count: int = 1, rank: int = 0, label: str = "filing"
                 "label": fact["label"],
                 "unique_fact_id": fact["fact_id"],
                 "context": fact["context_ref"],
+                "fiscal_period_label": _period_label(fact["context_ref"]["period"]),
                 "unit": fact["unit"],
                 "sections": fact["sections"],
                 "old_value": fact["value"],
@@ -359,6 +368,8 @@ def inject(filing_url: str, count: int = 1, rank: int = 0, label: str = "filing"
             "ANSWER KEY (do not show this to the model under test)",
             f"document to test : for_llm/{name}.htm",
             f"changed number   : {fact['label']} ({fact['concept']})",
+            f"fiscal period    : {_period_label(fact['context_ref']['period'])}  "
+            f"(contextRef=\"{fact['context_ref']['context_id']}\", unit={fact['unit']})",
             f"original value   : {fact['value']}",
             f"injected value   : {plan['new_value']}",
             f"places changed  : {len(plan['occurrences'])} in this one file (same number, printed {len(plan['occurrences'])}x)",
@@ -366,6 +377,11 @@ def inject(filing_url: str, count: int = 1, rank: int = 0, label: str = "filing"
                 f"{o['parsed']['text']} -> {o['new_text']} (tag id {o['fact_id']})" for o in plan["occurrences"]
             ),
             "sections         : " + "; ".join(fact["sections"]),
+            "to find it by hand: open for_llm/" + name + ".htm in a text editor and search (Ctrl/Cmd-F) for one "
+            "of these ix:nonFraction tag ids: " + ", ".join(f'id="{o["fact_id"]}"' for o in plan["occurrences"])
+            + f'. Each shows "{plan["occurrences"][0]["new_text"]}" where the real 10-K (see good.htm, same tag id) '
+            f'shows "{plan["occurrences"][0]["parsed"]["text"]}". The tag\'s contextRef attribute will read '
+            f'"{fact["context_ref"]["context_id"]}", matching the fiscal period above.',
             f"broken rules    : {len(details)} (all fail the rounding band)",
             *[f"  - {d}" for d in details],
             f"rules off by any amount (exact test): {len(verification['off_by_any_amount'])}",

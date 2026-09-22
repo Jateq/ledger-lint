@@ -5,7 +5,7 @@ structured data tags embedded in the filing) and checks whether the numbers
 are internally consistent: do the line items that should add up to a total
 actually add up? Are there tagging errors (bad signs, invalid dates,
 deprecated elements)? Are there numbers in the filing that no rule ever
-checks at all (orphan facts)?
+checks at all (orphan facts)
 
 Built within cps-vida lab research
 
@@ -20,21 +20,47 @@ Built within cps-vida lab research
    its value, its time period, its unit, which section of the filing it's
    in. Merge duplicate occurrences of the same fact into one, without
    losing track of where each copy came from.
-3. **Build constraints.** Two independent sources of "rules a number should
-   obey": the filing's own declared arithmetic (e.g. R&D expense + other
-   items = Operating Expenses), and the
+3. **Build constraints.** Three independent sources of "rules a number
+   should obey": the filing's own declared arithmetic (e.g. R&D expense +
+   other items = Operating Expenses), the
    [XBRL US Data Quality Committee](https://xbrl.us/dqc)'s official rule
-   set (sign checks, invalid dates, deprecated elements, and more).
-4. **Check consistency.** For every arithmetic constraint, does the sum of
-   the parts actually equal the reported total — exactly, or at least
-   within the rounding tolerance implied by how precisely each number was
-   reported?
-5. **Find orphans.** Across the whole filing, is there any reported number
+   set (sign checks, invalid dates, deprecated elements, and more), and a
+   library of ~50 financial-ratio identities built from reference textbooks
+   (e.g. gross profit = revenue − cost of revenue, assets = liabilities +
+   equity).
+4. **Check consistency.** For every arithmetic constraint (filer-calc or
+   ratio-identity), does the sum of the parts actually equal the reported
+   total — exactly, or at least within the rounding tolerance implied by
+   how precisely each number was reported?
+5. **Check global satisfiability with Z3.** Beyond checking constraints one
+   at a time, can *every* complete constraint hold *simultaneously*, given
+   the values the filing actually reports? SAT means the filing is
+   internally consistent as a whole; UNSAT names exactly which constraints
+   can't all be true together. This is also the gate a filing must pass
+   before it's used as a "clean" document for bug injection (step 8).
+6. **Compute the ratio library.** Alongside the identity checks, ~50
+   standard financial ratios (current ratio, margins, ROE, coverage
+   ratios, ...) are computed where the filing has the needed tags, each
+   one tagged with which source PDF defines it and whether it fell outside
+   a textbook rule-of-thumb range (advisory only — ratios are never treated
+   as errors, since a ratio of 0.9 or 5 can both be normal).
+7. **Find orphans.** Across the whole filing, is there any reported number
    that no constraint ever touches? Those are the numbers nothing is
    checking.
-6. **Report.** One report per filing (never averaged across companies,
+8. **Report.** One report per filing (never averaged across companies,
    since real filings vary a lot) — coverage %, consistency %, orphan
-   count, and where the numbers came from.
+   count, Z3 status, ratio usage, and where the numbers came from.
+9. **Inject a bug (`inject.py`).** Take a filing that passed the Z3 gate,
+   change one reported number just enough to break a rule, and write it
+   back into a byte-exact copy of the original `.htm` — producing a
+   verified good/bad pair with an answer key, for testing whether an LLM
+   can find and localize the planted error.
+10. **Verify any file by hand (`verify.py`).** Run the same extract →
+    constraints → check → Z3 pipeline against any single local `.htm` (the
+    original, a bug-injected copy, or one you edited yourself) and print
+    whether it's clean (SAT) or broken (UNSAT) — a separate, standalone
+    tool from `inject.py`, for spot-checking a file after the fact rather
+    than creating one.
 
 ## Quick start
 
@@ -53,6 +79,52 @@ python run.py AAPL
 This prints a full report to your terminal and writes it to
 `reports/report_AAPL_<accession>.json`. Takes a few minutes — the DQC
 validation step alone runs a large rule set against the whole filing.
+
+## All run commands
+
+Run these from `ledger-lint/` with the venv active (`source .venv/bin/activate`
+first, every new terminal).
+
+**Full report on a real filing:**
+```bash
+python run.py AAPL                          # latest 10-K (takes minutes, DQC included)
+python run.py AAPL --limit 3                # 3 most recent 10-Ks, reported separately
+```
+Writes `reports/report_<TICKER>_<accession>.json`, `_constraints.csv`,
+`_ratios.csv`, and `summary_<TICKER>.csv`.
+
+**Bug-injection dataset** (for testing whether an LLM can find a planted error):
+```bash
+python inject.py AAPL                       # 1 error case
+python inject.py AAPL --count 5             # 5 cases, each a different fact
+python inject.py AAPL --count 5 --rank 5    # skip the first 5 candidates, get different facts
+python inject.py <filing URL>               # by URL instead of ticker
+```
+Writes `datasets/<TICKER>/<accession>/`: `good.htm` (clean), `for_llm/case_NN.htm`
+(give these to the model under test), `answers/case_NN.txt` + `.json` (keep
+away from the model), `summary.json`.
+
+**Manually check any local file:**
+```bash
+python verify.py datasets/AAPL/000032019325000079/for_llm/case_01.htm
+python verify.py datasets/AAPL/000032019325000079/good.htm
+python verify.py <file.htm> --dqc                        # also run DQC (slow)
+python verify.py <file.htm> --url <original filing URL>  # only if schema files are missing
+```
+Prints `CLEAN (SAT)` or `ERROR FOUND (UNSAT)`.
+
+**Individual stages** (mostly for debugging — each defaults to Apple's URL
+if you give no argument):
+```bash
+python ratios.py AAPL      # all 52 ratios + identity checks
+python solver.py [url]     # Z3 gate + smoke test
+python fetch.py            # ticker -> filing URL
+python extract.py          # fact extraction
+python constraints.py      # filer-calc + DQC rule building
+python check.py            # constraint checks
+python orphans.py          # uncovered facts
+python report.py           # report only
+```
 
 **Important:** your Mac likely has several Python installs (Homebrew,
 system, framework builds). Arelle requires Python 3.10+, so this project's
@@ -247,6 +319,32 @@ Output, `datasets/<TICKER>/<accession>/`:
 - `summary.json` — one row per case, with verification status
 - `_support/` — schema + linkbase files Arelle needs for local copies
 
+**How a fact is identified.** In inline XBRL every number is tagged
+`<ix:nonFraction name="..." contextRef="..." unitRef="..." id="...">`. A
+`contextRef` (e.g. `c-18`) is defined once per (entity, period, dimensions)
+combination and then reused by every tag that needs it — 105 different
+concepts in Apple's filing all point at `c-18` for "FY2024, whole company,
+no segment breakdown." So the same concept (e.g. `OperatingIncomeLoss`) can
+appear at many different `contextRef`s (one per year, and again per segment
+if it's broken out), and each of those is a genuinely different number.
+
+The **unique key for one specific entry is `name` + `contextRef` +
+`unitRef` together** — this is exactly `extract.py`'s dedup key
+(`numeric_dedup_key`, `extract.py:94`). Two tags with the same key are not
+two different facts, they're the *same* fact printed twice (e.g. once in
+the income statement, once again in a footnote); `extract.py` links them
+together under one fact's `occurrences` list of tag `id`s. `id` itself is
+never part of the key — it only locates one specific spot in the HTML.
+
+`inject.py` uses this: `rank_candidates` picks a fact by its unique key
+(so it always targets one specific concept in one specific year), then
+`plan_injection` looks up every `id` in that fact's `occurrences` and edits
+all of them to the same new number, so the document stays internally
+consistent. Each answer key names the exact tag `id`s, the `contextRef`,
+and the fiscal period, and gives a plain "search for `id="f-103"`, it
+should say X but shows Y" line so the injected number can be found by eye
+without running any code.
+
 ### `verify.py` — manual full check of one local file
 `python verify.py datasets/AAPL/<accession>/for_llm/case_01.htm [--dqc]`.
 Runs extract → constraints → exact and rounding-band math → Z3, and prints
@@ -281,9 +379,9 @@ Apple's real FY2025 10-K and produced a complete report:
 | Find filing | `fetch.py` | ✅ done, tested against real Apple filings |
 | Extract facts | `extract.py` | ✅ done — one known gap: conflicting-duplicate-value flagging |
 | DQC engine setup | `setup_dqc.py` | ✅ done, tested — found real DQC violations in Apple's 10-K |
-| Build constraints | `constraints.py` | ✅ done, tested — 168 filer-calc + 2 real DQC constraints |
-| Check consistency | `check.py` | ✅ done, tested — 168/168 filer-calc pass exactly |
-| Detect orphans | `orphans.py` | ✅ done, tested — 341/880 facts orphaned |
+| Build constraints | `constraints.py` | ✅ done, tested — 168 filer-calc + 2 real DQC + 13 ratio-identity constraints |
+| Check consistency | `check.py` | ✅ done, tested — 168/168 filer-calc pass exactly, 13/13 ratio-identity pass |
+| Detect orphans | `orphans.py` | ✅ done, tested — 613/880 facts covered (267 orphaned) |
 | Generate report | `report.py` | ✅ done, tested — full JSON + readable summary |
 | Orchestrate everything | `run.py` | ✅ done — ticker in, `report_<TICKER>_<accession>.json` (+ constraints and ratios CSVs) out |
 | Z3 gate | `solver.py` | ✅ done — SAT on clean Apple and Tesla |
